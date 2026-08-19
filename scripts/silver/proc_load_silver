@@ -1,0 +1,239 @@
+
+/*
+=========================================================================================================================
+stored procedure : load silver layer 
+=========================================================================================================================
+
+Script Purpose:
+This stored procedure performs the ETL (Extract, Transform, Load) process to
+populate the 'silver' schema tables from the 'bronze schema.
+
+
+Actions Performed :
+Truncates Silver tables.
+Inserts transformed and cleansed data from Bronze into Silver tables.
+
+
+Parameters:
+None.
+This stored procedure does not accept any parameters or return any values.
+
+
+Usage Example:
+EXEC Silver.load_silver ;
+============================================================================================================================== 
+*/
+
+
+
+
+CREATE OR ALTER PROCEDURE SILVER.LOAD_DATA AS
+
+BEGIN
+
+
+print 'truncating table silver.crm_cus_info' ; 
+TRUNCATE TABLE silver.crm_cus_info;
+print 'inserting into silver.crm_cus_info' ; 
+
+	insert into silver.crm_cus_info (
+	cst_id,
+	cst_key,
+	cst_firstname,
+	cst_lastname,
+	cst_marital_status,
+	cst_gndr,
+	cst_create_date)
+
+
+	select  cst_id ,
+
+			cst_key,
+
+			trim(cst_firstname), 
+
+			trim(cst_lastname),
+ 
+			case when upper(trim(cst_marital_status)) = 'S' then 'Single'
+				 when upper(trim(cst_marital_status)) = 'M' then 'Married'
+				 else 'n/a'
+			end as cst_marital_status  ,
+
+
+			case when upper(trim(cst_gndr)) = 'M' then 'Male'
+				 when upper(trim(cst_gndr)) = 'F' then 'Female'
+				 else 'n/a'
+			end as cst_gender,
+
+			cst_create_date
+
+	from (
+	select * , row_number() over (partition by cst_id order by cst_create_date desc) as flag_last
+	from bronze.crm_cus_info
+	where cst_id is not null
+	) as d 
+	where flag_last =1;
+
+
+	--------------------------------------------------
+print 'truncating table silver.crm_sls_info' ; 
+ TRUNCATE TABLE silver.crm_sls_info;
+ print 'inserting into silver.crm_sls_info' ; 
+
+	with cte as (
+	select sls_ord_num , 
+	sls_prd_key, 
+	sls_cust_id, 
+
+	case 
+		when
+		sls_order_dt='0' or 
+		len(sls_order_dt)!=8
+		then null 
+		else cast(concat(substring(sls_order_dt, 1,4),'-' ,substring(sls_order_dt,5,2) , '-', substring(sls_order_dt,7,2)) as date )
+		end as sls_order_dt ,
+	sls_ship_dt
+	, 
+	sls_due_dt ,
+	sls_sales as old_sls_sales,
+	sls_quantity , 
+	sls_price as old_sls_price, 
+	case 
+		 when sls_sales is null or sls_sales<=0 or sls_sales !=sls_quantity*sls_price
+		 then ABS(sls_quantity)*ABS(sls_price) 
+		 ELSE sls_sales  end as sls_sales
+
+	from bronze.crm_sls_info) 
+	insert into silver.crm_sls_info (
+	sls_ord_num ,
+	sls_prd_key, 
+	sls_cust_id, 
+	sls_order_dt ,
+	sls_ship_dt , 
+	sls_due_dt ,
+	sls_sales ,
+	sls_quantity ,
+	sls_price ) 
+
+	select 
+	sls_ord_num , 
+	sls_prd_key, 
+	sls_cust_id, 
+	sls_order_dt,
+	sls_ship_dt, 
+	sls_due_dt ,
+	sls_sales ,
+	sls_quantity ,
+	case 
+		 when old_sls_price is null or old_sls_price<=0 or old_sls_price !=sls_sales/sls_quantity
+		 then cast(round(ABS(sls_sales/nullif(sls_quantity, 0)), 0) as decimal(10,2))
+		 else old_sls_price  end as sls_price
+
+		 from cte;
+
+
+
+	---------------------------------------------------
+print 'truncating table silver.crm_prd_info' ; 
+TRUNCATE TABLE silver.crm_prd_info;
+ print 'inserting into silver.crm_prd_info' ; 
+
+
+	insert into silver.crm_prd_info ( prd_id ,
+	prd_key ,
+	cat_id ,
+	prd_nm , 
+	prd_cost ,
+	prd_line , 
+	prd_start_dt , 
+	prd_end_dt 
+	 )
+
+
+	select
+	prd_id,
+	substring(prd_key , 7 , LEN(prd_key)) as prd_key ,
+	replace(substring(prd_key,1, 5) , '-' , '_') as cat_id ,
+	prd_nm,
+	isnull(prd_cost,0) as prd_cost , 
+
+	case upper(trim(prd_line))
+		when 'M' then 'Mountain'
+		when 'S' then 'Other Sales'
+		when 'R' then 'Road'
+		when 'T' then 'Touring'
+		else 'n/a' end as prd_line,
+
+	cast(prd_start_dt as date) as prd_start_dt,
+	cast(dateadd(day , -1 ,lead(prd_start_dt) over(partition by prd_key order by prd_start_dt asc)) as date) as prd_end_dt
+
+	from bronze.crm_prd_info ;
+--------------------------------------------------------------------------------------------------
+	
+
+print 'truncating table silver.erp_cust_az12' ; 
+TRUNCATE TABLE silver.erp_cust_az12;
+print 'inserting into silver.erp_cust_az12' ; 
+
+	
+
+	INSERT INTO silver.erp_cust_az12 (
+	CID,
+	BDATE,
+	GEN )
+
+	select  
+	CASE 
+			WHEN CID LIKE 'NAS%' THEN substring(CID , 4 , LEN(CID))
+			ELSE CID 
+			END as CID, 
+
+	CASE    WHEN BDATE >GETDATE() then NULL 
+			ELSE BDATE
+			END AS BDATE ,
+	CASE
+			when UPPER(TRIM(GEN)) = 'M' then 'Male'
+			when UPPER(TRIM(GEN)) = 'F' then 'Female'
+			when UPPER(TRIM(GEN))!='Female' OR UPPER(TRIM(GEN))!='Male' OR UPPER(TRIM(GEN)) IS NULL
+			THEN 'N/A'
+			else UPPER(TRIM(GEN))
+			end as GEN 
+	from bronze.erp_cust_az12 ;
+
+
+
+	------------------------------------------------------------------------------------
+
+
+print 'truncating table SILVER.erp_loc_a101' ; 
+TRUNCATE TABLE SILVER.erp_loc_a101;
+print 'inserting into SILVER.erp_loc_a101' ; 
+
+
+	INSERT INTO SILVER.erp_loc_a101 (CID , CNTRY)
+
+	select REPLACE(CID ,'-','') AS CID ,
+	CASE WHEN TRIM(CNTRY) IN ('USA','US') THEN 'Unaited States'
+			 WHEN TRIM(CNTRY) ='DE' THEN 'Germany'
+			 WHEN TRIM(CNTRY) ='' OR CNTRY IS NULL THEN 'N/A'
+			 ELSE TRIM(CNTRY)
+		END AS CNTRY
+	from bronze.erp_loc_a101;  
+	-------------------------------------------------------
+print 'truncating table SILVER.erp_px_cat_g1v2' ; 
+TRUNCATE TABLE SILVER.erp_px_cat_g1v2;
+print 'inserting into SILVER.erp_px_cat_g1v2' ; 
+
+	INSERT INTO SILVER.erp_px_cat_g1v2 (
+	ID,
+	CAT,
+	SUBCAT,
+	MAINTENANCE)
+
+	SELECT ID,
+	CAT,
+	SUBCAT,
+	MAINTENANCE
+	FROM BRONZE.erp_px_cat_g1v2;
+
+	END
